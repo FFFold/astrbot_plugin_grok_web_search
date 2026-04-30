@@ -11,11 +11,9 @@ import shutil
 import tempfile
 import zipfile
 from pathlib import Path
-import re
 
 import aiohttp
 import asyncio
-import json
 import os
 import time
 
@@ -46,10 +44,11 @@ from .tool.tool import (
     DEFAULT_MODEL,
     build_headers,
     extract_urls,
-    is_safe_url,
     normalize_api_key,
     normalize_base_url,
+    normalize_sources,
     parse_json_config,
+    parse_json_object,
 )
 from .tool.card_render import (
     render_search_card,
@@ -466,11 +465,11 @@ class GrokSearchPlugin(Star):
                         }
 
                     # 尝试解析 JSON 格式响应
-                    parsed = self._try_parse_json_response(text)
+                    parsed = parse_json_object(text)
                     if parsed is not None:
                         content = str(parsed.get("content", ""))
                         raw_sources = parsed.get("sources", [])
-                        sources = self._normalize_sources(raw_sources)
+                        sources = normalize_sources(raw_sources)
                         return {
                             "ok": True,
                             "content": content,
@@ -668,82 +667,6 @@ class GrokSearchPlugin(Star):
         lines.append("\n[提示: 请使用纯文本格式回复用户，不要使用 Markdown 格式]")
 
         return "\n".join(lines)
-
-    def _try_parse_json_response(self, text: str) -> dict | None:
-        """尝试解析 JSON 响应，支持多种格式
-
-        支持的格式：
-        1. 纯 JSON 对象
-        2. Markdown 代码块包裹的 JSON
-        3. 混合文本中的 JSON（支持嵌套结构）
-        """
-
-        if not text or not text.strip():
-            return None
-
-        text = text.strip()
-
-        # 尝试直接解析
-        if text.startswith("{") and text.endswith("}"):
-            try:
-                parsed = json.loads(text)
-                if isinstance(parsed, dict):
-                    return parsed
-            except json.JSONDecodeError:
-                pass
-
-        # 尝试提取 Markdown 代码块中的 JSON
-        code_block_pattern = r"```(?:json)?\s*\n?([\s\S]*?)\n?```"
-        matches = re.findall(code_block_pattern, text)
-        for match in matches:
-            try:
-                parsed = json.loads(match.strip())
-                if isinstance(parsed, dict):
-                    return parsed
-            except json.JSONDecodeError:
-                continue
-
-        # 使用 JSONDecoder.raw_decode 从每个 { 起点尝试解码（支持嵌套结构）
-        decoder = json.JSONDecoder()
-        start_idx = 0
-        max_attempts = 10  # 限制尝试次数
-
-        while start_idx < len(text) and max_attempts > 0:
-            brace_pos = text.find("{", start_idx)
-            if brace_pos == -1:
-                break
-
-            try:
-                parsed, end_idx = decoder.raw_decode(text, idx=brace_pos)
-                if isinstance(parsed, dict) and (
-                    "content" in parsed or "sources" in parsed
-                ):
-                    return parsed
-                start_idx = end_idx
-            except json.JSONDecodeError:
-                start_idx = brace_pos + 1
-
-            max_attempts -= 1
-
-        return None
-
-    def _normalize_sources(self, raw_sources: list) -> list[dict[str, str]]:
-        """归一化 sources 结构，仅允许 http/https 协议"""
-        sources = []
-        if isinstance(raw_sources, list):
-            for item in raw_sources:
-                if isinstance(item, dict) and item.get("url"):
-                    url = str(item.get("url", ""))
-                    if not is_safe_url(url):
-                        continue
-                    sources.append(
-                        {
-                            "url": url,
-                            "title": str(item.get("title") or ""),
-                            "snippet": str(item.get("snippet") or ""),
-                        }
-                    )
-        return sources
 
     def _extract_sources_from_text(self, text: str) -> list[dict[str, str]]:
         """从文本中提取 URL 作为来源，仅允许 http/https 协议"""

@@ -225,18 +225,80 @@ def normalize_base_url_value(base_url: str) -> str:
     return normalize_base_url(base_url)
 
 
-def coerce_json_object(text: str) -> dict[str, Any] | None:
-    """尝试将字符串解析为 JSON 对象"""
-    text = text.strip()
-    if not text:
+def parse_json_object(text: str) -> dict[str, Any] | None:
+    """尝试从字符串中解析出 JSON 对象（增强版）。
+
+    支持：
+    1. 纯 JSON 对象
+    2. Markdown 代码块包裹的 JSON
+    3. 混合文本中的 JSON（含嵌套结构，优先返回含 content/sources 的对象）
+    """
+    if not text or not text.strip():
         return None
+    text = text.strip()
+
+    # 1) 纯 JSON
     if text.startswith("{") and text.endswith("}"):
         try:
             value = json.loads(text)
-            return value if isinstance(value, dict) else None
+            if isinstance(value, dict):
+                return value
         except json.JSONDecodeError:
-            return None
+            pass
+
+    # 2) Markdown 代码块
+    for match in re.findall(r"```(?:json)?\s*\n?([\s\S]*?)\n?```", text):
+        try:
+            value = json.loads(match.strip())
+            if isinstance(value, dict):
+                return value
+        except json.JSONDecodeError:
+            continue
+
+    # 3) 混合文本，从每个 { 起点尝试解码，优先含 content/sources 的对象
+    decoder = json.JSONDecoder()
+    start_idx = 0
+    max_attempts = 10
+    while start_idx < len(text) and max_attempts > 0:
+        brace_pos = text.find("{", start_idx)
+        if brace_pos == -1:
+            break
+        try:
+            value, end_idx = decoder.raw_decode(text, idx=brace_pos)
+            if isinstance(value, dict) and ("content" in value or "sources" in value):
+                return value
+            start_idx = end_idx
+        except json.JSONDecodeError:
+            start_idx = brace_pos + 1
+        max_attempts -= 1
+
     return None
+
+
+def coerce_json_object(text: str) -> dict[str, Any] | None:
+    """已合并到 parse_json_object，保留以兼容外部调用。"""
+    return parse_json_object(text)
+
+
+def normalize_sources(raw_sources: Any) -> list[dict[str, str]]:
+    """归一化 sources 列表：仅保留 url 安全且为 dict 的条目。"""
+    sources: list[dict[str, str]] = []
+    if not isinstance(raw_sources, list):
+        return sources
+    for item in raw_sources:
+        if not isinstance(item, dict) or not item.get("url"):
+            continue
+        url = str(item.get("url", ""))
+        if not is_safe_url(url):
+            continue
+        sources.append(
+            {
+                "url": url,
+                "title": str(item.get("title") or ""),
+                "snippet": str(item.get("snippet") or ""),
+            }
+        )
+    return sources
 
 
 def is_safe_url(url: str) -> bool:
