@@ -510,10 +510,10 @@ _RE_CODE_FENCE = re.compile(r"^```")
 class _Element:
     """渲染元素基类"""
 
-    def height(self, ctx: "_Ctx") -> int:
+    def height(self, ctx: _Ctx) -> int:
         raise NotImplementedError
 
-    def render(self, ctx: "_Ctx", x: int, y: int) -> int:
+    def render(self, ctx: _Ctx, x: int, y: int) -> int:
         raise NotImplementedError
 
 
@@ -521,14 +521,14 @@ class _TextElem(_Element):
     def __init__(self, text: str):
         self.text = text
 
-    def _wrapped(self, ctx: "_Ctx") -> list[list[_RichSpan]]:
+    def _wrapped(self, ctx: _Ctx) -> list[list[_RichSpan]]:
         spans = _parse_rich(self.text)
         return _wrap_rich(spans, ctx.f_content, ctx.f_bold, ctx.cw, ctx.draw)
 
-    def height(self, ctx: "_Ctx") -> int:
+    def height(self, ctx: _Ctx) -> int:
         return len(self._wrapped(ctx)) * _line_height(ctx.f_content) + 2
 
-    def render(self, ctx: "_Ctx", x: int, y: int) -> int:
+    def render(self, ctx: _Ctx, x: int, y: int) -> int:
         lh = _line_height(ctx.f_content)
         for line_spans in self._wrapped(ctx):
             _draw_rich_spans(
@@ -550,14 +550,14 @@ class _BulletElem(_Element):
         self.text = text
         self.marker = marker
 
-    def _wrapped(self, ctx: "_Ctx") -> list[list[_RichSpan]]:
+    def _wrapped(self, ctx: _Ctx) -> list[list[_RichSpan]]:
         spans = _parse_rich(self.text)
         return _wrap_rich(spans, ctx.f_content, ctx.f_bold, ctx.cw - 22, ctx.draw)
 
-    def height(self, ctx: "_Ctx") -> int:
+    def height(self, ctx: _Ctx) -> int:
         return len(self._wrapped(ctx)) * _line_height(ctx.f_content) + 2
 
-    def render(self, ctx: "_Ctx", x: int, y: int) -> int:
+    def render(self, ctx: _Ctx, x: int, y: int) -> int:
         lh = _line_height(ctx.f_content)
         ctx.draw.text((x + 2, y), self.marker, font=ctx.f_content, fill=THEME["bullet"])
         for line_spans in self._wrapped(ctx):
@@ -579,11 +579,11 @@ class _QuoteElem(_Element):
     def __init__(self, lines: list[str]):
         self.text = "\n".join(lines)
 
-    def height(self, ctx: "_Ctx") -> int:
+    def height(self, ctx: _Ctx) -> int:
         lines = _wrap_plain(self.text, ctx.f_content, ctx.cw - 18, ctx.draw)
         return len(lines) * _line_height(ctx.f_content) + 12
 
-    def render(self, ctx: "_Ctx", x: int, y: int) -> int:
+    def render(self, ctx: _Ctx, x: int, y: int) -> int:
         lh = _line_height(ctx.f_content)
         lines = _wrap_plain(self.text, ctx.f_content, ctx.cw - 18, ctx.draw)
         h = len(lines) * lh
@@ -603,14 +603,14 @@ class _CodeElem(_Element):
     def __init__(self, lines: list[str]):
         self.code = "\n".join(lines)
 
-    def height(self, ctx: "_Ctx") -> int:
+    def height(self, ctx: _Ctx) -> int:
         code_lines = self.code.split("\n")
         wrapped: list[str] = []
         for ln in code_lines:
             wrapped.extend(_wrap_plain(ln or " ", ctx.f_code, ctx.cw - 24, ctx.draw))
         return len(wrapped) * (ctx.f_code.size + 5) + 20
 
-    def render(self, ctx: "_Ctx", x: int, y: int) -> int:
+    def render(self, ctx: _Ctx, x: int, y: int) -> int:
         code_lines = self.code.split("\n")
         wrapped: list[str] = []
         for ln in code_lines:
@@ -627,10 +627,10 @@ class _CodeElem(_Element):
 
 
 class _GapElem(_Element):
-    def height(self, ctx: "_Ctx") -> int:
+    def height(self, ctx: _Ctx) -> int:
         return 6
 
-    def render(self, ctx: "_Ctx", x: int, y: int) -> int:
+    def render(self, ctx: _Ctx, x: int, y: int) -> int:
         return y + 6
 
 

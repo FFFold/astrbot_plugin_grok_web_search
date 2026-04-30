@@ -7,21 +7,20 @@ AstrBot 插件：Grok 联网搜索
 - Skill 脚本动态安装
 """
 
+import asyncio
+import os
 import shutil
 import tempfile
+import time
 import zipfile
 from pathlib import Path
 
 import aiohttp
-import asyncio
-import os
-import time
-
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
-from astrbot.core.star.filter.command import GreedyStr
 from astrbot.api.star import Context, Star
 from astrbot.core.message.components import Image
+from astrbot.core.star.filter.command import GreedyStr
 from astrbot.core.utils.io import download_image_by_url, file_to_base64
 from astrbot.core.utils.quoted_message.chain_parser import (
     _extract_image_refs_from_component_chain,
@@ -39,6 +38,13 @@ try:
     from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 except ImportError:
     get_astrbot_data_path = None
+from .tool.card_render import (
+    init_fonts,
+    render_search_card,
+)
+from .tool.card_render import (
+    set_logger as set_card_logger,
+)
 from .tool.tool import (
     DEFAULT_JSON_SYSTEM_PROMPT,
     DEFAULT_MODEL,
@@ -51,11 +57,6 @@ from .tool.tool import (
     parse_json_object,
     resolve_system_prompt,
     safe_number,
-)
-from .tool.card_render import (
-    render_search_card,
-    init_fonts,
-    set_logger as set_card_logger,
 )
 
 PLUGIN_NAME = "astrbot_plugin_grok_web_search"
