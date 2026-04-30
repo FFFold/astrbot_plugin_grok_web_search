@@ -44,6 +44,7 @@ except ImportError:
 from .tool.tool import (
     DEFAULT_JSON_SYSTEM_PROMPT,
     DEFAULT_MODEL,
+    build_headers,
     extract_urls,
     is_safe_url,
     normalize_api_key,
@@ -215,13 +216,8 @@ class GrokSearchPlugin(Star):
 
         # 通过 v1/models 接口验证连通性和密钥有效性
         models_url = f"{base_url}/v1/models"
-        headers = {"Authorization": f"Bearer {api_key}"}
         extra_headers = self._parse_json_config("extra_headers")
-        if extra_headers:
-            protected = {"authorization", "content-type"}
-            for key, value in extra_headers.items():
-                if str(key).lower() not in protected:
-                    headers[str(key)] = str(value)
+        headers = build_headers(api_key, extra_headers or None)
 
         # 获取代理配置
         proxy = self.config.get("proxy", "").strip() or None
