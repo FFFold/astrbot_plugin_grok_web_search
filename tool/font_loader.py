@@ -212,8 +212,7 @@ def _fetch_to_file(url: str, dest_archive: str, font_dir: str) -> None:
             r = urllib.request.Request(
                 url, headers={"Range": f"bytes={byte_start}-{byte_end}"}
             )
-            response = _urlopen(r, timeout=180)
-            with open(part_file, "wb") as f:
+            with _urlopen(r, timeout=180) as response, open(part_file, "wb") as f:
                 while True:
                     buf = response.read(64 * 1024)
                     if not buf:
@@ -264,12 +263,14 @@ def _fetch_to_file(url: str, dest_archive: str, font_dir: str) -> None:
     if total_mb:
         _log.info(f"文件大小: {total_mb:.1f}MB")
 
-    resp = _urlopen(urllib.request.Request(url), timeout=180)
-    downloaded = 0
-    last_logged_pct = -1
     part_path = dest_archive + ".part"
 
-    with open(part_path, "wb") as f:
+    with (
+        _urlopen(urllib.request.Request(url), timeout=180) as resp,
+        open(part_path, "wb") as f,
+    ):
+        downloaded = 0
+        last_logged_pct = -1
         while True:
             chunk = resp.read(64 * 1024)
             if not chunk:

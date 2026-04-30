@@ -1002,14 +1002,17 @@ class GrokSearchPlugin(Star):
             logger.error(f"[{PLUGIN_NAME}] on_astrbot_loaded 处理失败: {e}")
 
     async def terminate(self):
-        """插件销毁：取消后台任务并关闭 HTTP 会话"""
-        if self._font_init_task and not self._font_init_task.done():
-            self._font_init_task.cancel()
+        """插件销毁：等待后台字体任务（不可取消）并关闭 HTTP 会话。
+
+        注意：``_font_init_task`` 包装的是 ``asyncio.to_thread`` 调用，
+        取消 Task 不会终止底层线程，因此这里只 detach，让线程自行结束。
+        """
+        if self._font_init_task and self._font_init_task.done():
             try:
                 await self._font_init_task
-            except (asyncio.CancelledError, Exception):
+            except Exception:
                 pass
-            self._font_init_task = None
+        self._font_init_task = None
         if self._session and not self._session.closed:
             await self._session.close()
             self._session = None
