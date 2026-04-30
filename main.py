@@ -774,53 +774,7 @@ class GrokSearchPlugin(Star):
         image_sent = False
 
         if use_image and result.get("ok"):
-            content = result.get("content", "")
-            sources = result.get("sources", [])
-            elapsed = result.get("elapsed_ms", 0)
-            usage = result.get("usage") or {}
-            total_tokens = usage.get("total_tokens", 0)
-            model = self.config.get("model", "")
-            theme = self.config.get("card_theme", "auto")
-
-            tmp_path = None
-            try:
-                with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
-                    tmp_path = tmp.name
-                render_search_card(
-                    content=content,
-                    model=model,
-                    elapsed_ms=elapsed,
-                    total_tokens=total_tokens,
-                    output_path=tmp_path,
-                    theme=theme,
-                )
-                await event.send(MessageChain().file_image(tmp_path))
-                image_sent = True
-            except Exception as e:
-                logger.warning(f"[{PLUGIN_NAME}] 图片卡片发送失败，降级为文本: {e}")
-            finally:
-                if tmp_path and os.path.exists(tmp_path):
-                    os.remove(tmp_path)
-
-            # 来源链接单独以文本发送（可点击/复制）
-            if image_sent:
-                show_sources = self.config.get("show_sources", False)
-                max_sources = self.config.get("max_sources", 5)
-                if show_sources and sources:
-                    if max_sources > 0:
-                        sources = sources[:max_sources]
-                    src_lines = ["来源:"]
-                    for i, src in enumerate(sources, 1):
-                        url = src.get("url", "")
-                        title = src.get("title", "")
-                        if title:
-                            src_lines.append(f"  {i}. {title}\n     {url}")
-                        else:
-                            src_lines.append(f"  {i}. {url}")
-                    try:
-                        await event.send(MessageChain().message("\n".join(src_lines)))
-                    except Exception as e:
-                        logger.warning(f"[{PLUGIN_NAME}] 来源链接发送失败: {e}")
+            image_sent = await self._send_as_image_card(event, result)
 
         # 文本模式或图片发送失败时降级
         if not image_sent:
@@ -828,6 +782,54 @@ class GrokSearchPlugin(Star):
                 await event.send(MessageChain().message(self._format_result(result)))
             except Exception as e:
                 logger.warning(f"[{PLUGIN_NAME}] 发送搜索结果失败: {e}")
+
+    async def _send_as_image_card(self, event: AstrMessageEvent, result: dict) -> bool:
+        """将搜索结果渲染为图片卡片并发送，附带文本来源链接。
+
+        返回 True 表示图片已发送（来源链接以文本形式分开发送）；
+        返回 False 表示渲染或发送失败，调用方应降级为文本模式。
+        """
+        content = result.get("content", "")
+        sources = result.get("sources", [])
+        elapsed = result.get("elapsed_ms", 0)
+        usage = result.get("usage") or {}
+        total_tokens = usage.get("total_tokens", 0)
+        model = self.config.get("model", "")
+        theme = self.config.get("card_theme", "auto")
+
+        tmp_path: str | None = None
+        image_sent = False
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+                tmp_path = tmp.name
+            render_search_card(
+                content=content,
+                model=model,
+                elapsed_ms=elapsed,
+                total_tokens=total_tokens,
+                output_path=tmp_path,
+                theme=theme,
+            )
+            await event.send(MessageChain().file_image(tmp_path))
+            image_sent = True
+        except Exception as e:
+            logger.warning(f"[{PLUGIN_NAME}] 图片卡片发送失败，降级为文本: {e}")
+        finally:
+            if tmp_path:
+                Path(tmp_path).unlink(missing_ok=True)
+
+        # 来源链接单独以文本发送（可点击/复制）
+        if image_sent:
+            src_lines = self._render_sources(sources, header="来源", with_snippet=False)
+            if src_lines:
+                try:
+                    # _render_sources 返回的首行带前导换行，去掉以避免空行
+                    text = "\n".join(src_lines).lstrip("\n")
+                    await event.send(MessageChain().message(text))
+                except Exception as e:
+                    logger.warning(f"[{PLUGIN_NAME}] 来源链接发送失败: {e}")
+
+        return image_sent
 
     @filter.llm_tool(name="grok_web_search")
     async def grok_tool(
