@@ -80,6 +80,7 @@ class GrokSearchPlugin(Star):
         self.config = config or {}
         self._session: aiohttp.ClientSession | None = None
         self._card_fonts_ready = False
+        self._font_init_task: asyncio.Task | None = None
 
     async def _extract_content_from_event(
         self, event: AstrMessageEvent
@@ -173,7 +174,9 @@ class GrokSearchPlugin(Star):
         # 在后台初始化字体，仅在开启图片渲染模式下
         if self.config.get("render_as_image", False):
             set_card_logger(logger)
-            asyncio.get_event_loop().run_in_executor(None, self._init_fonts)
+            self._font_init_task = asyncio.create_task(
+                asyncio.to_thread(self._init_fonts)
+            )
 
         # 根据配置卸载不需要的 LLM Tool
         self._unregister_disabled_tools()
@@ -971,7 +974,14 @@ class GrokSearchPlugin(Star):
             logger.error(f"[{PLUGIN_NAME}] on_astrbot_loaded 处理失败: {e}")
 
     async def terminate(self):
-        """插件销毁：关闭 HTTP 会话"""
+        """插件销毁：取消后台任务并关闭 HTTP 会话"""
+        if self._font_init_task and not self._font_init_task.done():
+            self._font_init_task.cancel()
+            try:
+                await self._font_init_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._font_init_task = None
         if self._session and not self._session.closed:
             await self._session.close()
             self._session = None
