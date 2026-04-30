@@ -158,7 +158,6 @@ class GrokSearchPlugin(Star):
                 )
             else:
                 font_dir = os.path.join(os.path.dirname(__file__), "font")
-            set_card_logger(logger)
             self._card_fonts_ready = init_fonts(font_dir)
             if self._card_fonts_ready:
                 logger.info(f"[{PLUGIN_NAME}] 卡片渲染字体已就绪: {font_dir}")
@@ -171,6 +170,7 @@ class GrokSearchPlugin(Star):
         """插件初始化：验证配置并处理 Skill 安装"""
         # 在后台初始化字体，仅在开启图片渲染模式下
         if self.config.get("render_as_image", False):
+            set_card_logger(logger)
             asyncio.get_event_loop().run_in_executor(None, self._init_fonts)
 
         # 根据配置卸载不需要的 LLM Tool
