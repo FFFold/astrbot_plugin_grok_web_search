@@ -197,16 +197,8 @@ def normalize_api_key(api_key: str) -> str:
 
 
 def normalize_base_url(base_url: str) -> str:
-    """规范化 Base URL，移除尾部 / 和 /v1"""
-    base_url = base_url.strip().rstrip("/")
-    if base_url.endswith("/v1"):
-        return base_url[: -len("/v1")]
-    return base_url
-
-
-def normalize_base_url_value(base_url: str) -> str:
-    """过滤占位符 Base URL"""
-    base_url = base_url.strip()
+    """规范化 Base URL：过滤占位符、去尾 / 和 /v1。空/占位符返回 ""。"""
+    base_url = (base_url or "").strip()
     if not base_url:
         return ""
     placeholder = {
@@ -218,7 +210,16 @@ def normalize_base_url_value(base_url: str) -> str:
     }
     if base_url.upper() in placeholder:
         return ""
+    base_url = base_url.rstrip("/")
+    if base_url.endswith("/v1"):
+        base_url = base_url[: -len("/v1")]
     return base_url
+
+
+# 兼容别名（旧名义为"过滤占位符"，新版统一行为）
+def normalize_base_url_value(base_url: str) -> str:
+    """已合并到 normalize_base_url，保留以兼容外部调用。"""
+    return normalize_base_url(base_url)
 
 
 def coerce_json_object(text: str) -> dict[str, Any] | None:
@@ -313,7 +314,7 @@ def validate_config(
     Returns:
         错误 dict（验证失败）或 (normalized_base_url, normalized_api_key) 元组（成功）
     """
-    base_url = normalize_base_url_value(base_url)
+    base_url = normalize_base_url(base_url)
     api_key = normalize_api_key(api_key)
 
     if not base_url:
