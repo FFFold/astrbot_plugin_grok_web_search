@@ -156,6 +156,9 @@ class GrokSearchPlugin(Star):
         """Initialize card rendering fonts (runs in background)."""
         logger.info(f"[{PLUGIN_NAME}] 正在后台初始化卡片渲染字体 ...")
         try:
+            from .tool import font_loader
+
+            font_loader.set_proxy(self.config.get("proxy", "") or None)
             if get_astrbot_data_path:
                 font_dir = str(
                     Path(get_astrbot_data_path()) / "plugin_data" / PLUGIN_NAME / "font"

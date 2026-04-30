@@ -41,12 +41,30 @@ _SEVEN_Z_MAGIC = b"7z\xbc\xaf\x27\x1c"
 _VERSION_RE = re.compile(r"^v?(\d+\.\d+\.\d+)$")
 
 _log = logging.getLogger(__name__)
+# 可选的 HTTP/HTTPS 代理；为 None 时使用 urllib 默认行为（含 *_PROXY 环境变量）。
+_proxy: str | None = None
 
 
 def set_logger(logger: logging.Logger) -> None:
     """允许调用方注入自定义 logger。"""
     global _log
     _log = logger
+
+
+def set_proxy(proxy: str | None) -> None:
+    """配置字体下载使用的 HTTP/HTTPS 代理（如 'http://127.0.0.1:7890'）。"""
+    global _proxy
+    _proxy = proxy or None
+
+
+def _urlopen(req_or_url, timeout: float):
+    """带代理感知的 urlopen 包装。"""
+    if _proxy:
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": _proxy, "https": _proxy})
+        )
+        return opener.open(req_or_url, timeout=timeout)
+    return urllib.request.urlopen(req_or_url, timeout=timeout)
 
 
 # ─── 版本发现 ────────────────────────────────────────────────
@@ -62,7 +80,7 @@ def discover_latest_version(timeout: float = 8.0) -> str:
                 "Accept": "application/vnd.github+json",
             },
         )
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _urlopen(req, timeout=timeout) as resp:
             data = json.loads(resp.read().decode("utf-8", errors="replace"))
         tag = str(data.get("tag_name", "")).strip()
         m = _VERSION_RE.match(tag)
@@ -160,7 +178,7 @@ def _fetch_to_file(url: str, dest_archive: str, font_dir: str) -> None:
     total_size = 0
     try:
         probe = urllib.request.Request(url, headers={"Range": "bytes=0-0"})
-        probe_resp = urllib.request.urlopen(probe, timeout=30)
+        probe_resp = _urlopen(probe, timeout=30)
         if probe_resp.status == 206:
             content_range = probe_resp.headers.get("Content-Range", "")
             if "/" in content_range:
@@ -190,7 +208,7 @@ def _fetch_to_file(url: str, dest_archive: str, font_dir: str) -> None:
             r = urllib.request.Request(
                 url, headers={"Range": f"bytes={byte_start}-{byte_end}"}
             )
-            response = urllib.request.urlopen(r, timeout=180)
+            response = _urlopen(r, timeout=180)
             with open(part_file, "wb") as f:
                 while True:
                     buf = response.read(64 * 1024)
@@ -242,7 +260,7 @@ def _fetch_to_file(url: str, dest_archive: str, font_dir: str) -> None:
     if total_mb:
         _log.info(f"文件大小: {total_mb:.1f}MB")
 
-    resp = urllib.request.urlopen(urllib.request.Request(url), timeout=180)
+    resp = _urlopen(urllib.request.Request(url), timeout=180)
     downloaded = 0
     last_logged_pct = -1
     part_path = dest_archive + ".part"

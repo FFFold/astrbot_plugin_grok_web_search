@@ -102,7 +102,7 @@ async def grok_responses_search(
 
     # 构建用户消息内容
     user_input = build_user_content(enriched_query, images, kind="responses")
-    if isinstance(user_input, dict) and user_input is IMAGE_UNSUPPORTED_ERROR:
+    if user_input is IMAGE_UNSUPPORTED_ERROR:
         return IMAGE_UNSUPPORTED_ERROR
 
     # 构建 Responses API 请求体

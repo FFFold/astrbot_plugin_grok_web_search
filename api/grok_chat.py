@@ -99,7 +99,7 @@ async def grok_search(
 
     # 构建用户消息：如果有图片则使用多模态格式
     user_content = build_user_content(enriched_query, images, kind="chat")
-    if isinstance(user_content, dict) and user_content is IMAGE_UNSUPPORTED_ERROR:
+    if user_content is IMAGE_UNSUPPORTED_ERROR:
         return IMAGE_UNSUPPORTED_ERROR
     user_message: dict[str, Any] = {"role": "user", "content": user_content}
 
