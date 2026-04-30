@@ -15,14 +15,15 @@ import aiohttp
 
 from ..tool.tool import (
     DEFAULT_JSON_SYSTEM_PROMPT,
+    DEFAULT_MODEL,
     IMAGE_UNSUPPORTED_ERROR,
     build_headers,
+    build_user_content,
     format_http_error,
     get_local_time_info,
     make_error_result,
     merge_extra_body,
     normalize_base_url,
-    normalize_image,
     parse_sources_from_message,
     retry_request,
     validate_config,
@@ -33,7 +34,7 @@ async def grok_responses_search(
     query: str,
     base_url: str,
     api_key: str,
-    model: str = "grok-4-fast",
+    model: str = DEFAULT_MODEL,
     timeout: float = 60.0,
     extra_body: dict | None = None,
     extra_headers: dict | None = None,
@@ -100,25 +101,9 @@ async def grok_responses_search(
     enriched_query = f"{time_context}\n{query}"
 
     # 构建用户消息内容
-    if images:
-        user_content: list[dict[str, Any]] = [
-            {"type": "input_text", "text": enriched_query}
-        ]
-        for img_b64 in images:
-            result = normalize_image(img_b64)
-            if result is None:
-                return IMAGE_UNSUPPORTED_ERROR
-            mime, img_b64 = result
-            user_content.append(
-                {
-                    "type": "input_image",
-                    "image_url": f"data:{mime};base64,{img_b64}",
-                    "detail": "high",
-                }
-            )
-        user_input = user_content
-    else:
-        user_input = enriched_query
+    user_input = build_user_content(enriched_query, images, kind="responses")
+    if user_input is IMAGE_UNSUPPORTED_ERROR:
+        return IMAGE_UNSUPPORTED_ERROR
 
     # 构建 Responses API 请求体
     body: dict[str, Any] = {

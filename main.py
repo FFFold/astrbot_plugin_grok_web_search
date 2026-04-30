@@ -7,23 +7,20 @@ AstrBot 插件：Grok 联网搜索
 - Skill 脚本动态安装
 """
 
+import asyncio
+import os
 import shutil
 import tempfile
+import time
 import zipfile
 from pathlib import Path
-import re
 
 import aiohttp
-import asyncio
-import json
-import os
-import time
-
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
-from astrbot.core.star.filter.command import GreedyStr
 from astrbot.api.star import Context, Star
 from astrbot.core.message.components import Forward, Image, Node, Nodes, Reply
+from astrbot.core.star.filter.command import GreedyStr
 from astrbot.core.utils.io import download_image_by_url, file_to_base64
 from astrbot.core.utils.quoted_message.chain_parser import (
     _extract_image_refs_from_component_chain,
@@ -41,16 +38,25 @@ try:
     from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 except ImportError:
     get_astrbot_data_path = None
-from .tool.tool import (
-    DEFAULT_JSON_SYSTEM_PROMPT,
-    normalize_api_key,
-    normalize_base_url,
-    parse_json_config,
+from .tool.card_render import (
+    init_fonts,
+    render_search_card,
 )
 from .tool.card_render import (
-    render_search_card,
-    init_fonts,
     set_logger as set_card_logger,
+)
+from .tool.tool import (
+    DEFAULT_JSON_SYSTEM_PROMPT,
+    DEFAULT_MODEL,
+    build_headers,
+    extract_urls,
+    normalize_api_key,
+    normalize_base_url,
+    normalize_sources,
+    parse_json_config,
+    parse_json_object,
+    resolve_system_prompt,
+    safe_number,
 )
 
 PLUGIN_NAME = "astrbot_plugin_grok_web_search"
@@ -75,6 +81,7 @@ class GrokSearchPlugin(Star):
         self.config = config or {}
         self._session: aiohttp.ClientSession | None = None
         self._card_fonts_ready = False
+        self._font_init_task: asyncio.Task | None = None
 
     async def _extract_content_from_event(
         self, event: AstrMessageEvent
@@ -149,13 +156,15 @@ class GrokSearchPlugin(Star):
         """Initialize card rendering fonts (runs in background)."""
         logger.info(f"[{PLUGIN_NAME}] 正在后台初始化卡片渲染字体 ...")
         try:
+            from .tool import font_loader
+
+            font_loader.set_proxy(self.config.get("proxy", "") or None)
             if get_astrbot_data_path:
                 font_dir = str(
                     Path(get_astrbot_data_path()) / "plugin_data" / PLUGIN_NAME / "font"
                 )
             else:
                 font_dir = os.path.join(os.path.dirname(__file__), "font")
-            set_card_logger(logger)
             self._card_fonts_ready = init_fonts(font_dir)
             if self._card_fonts_ready:
                 logger.info(f"[{PLUGIN_NAME}] 卡片渲染字体已就绪: {font_dir}")
@@ -168,7 +177,10 @@ class GrokSearchPlugin(Star):
         """插件初始化：验证配置并处理 Skill 安装"""
         # 在后台初始化字体，仅在开启图片渲染模式下
         if self.config.get("render_as_image", False):
-            asyncio.get_event_loop().run_in_executor(None, self._init_fonts)
+            set_card_logger(logger)
+            self._font_init_task = asyncio.create_task(
+                asyncio.to_thread(self._init_fonts)
+            )
 
         # 根据配置卸载不需要的 LLM Tool
         self._unregister_disabled_tools()
@@ -212,13 +224,8 @@ class GrokSearchPlugin(Star):
 
         # 通过 v1/models 接口验证连通性和密钥有效性
         models_url = f"{base_url}/v1/models"
-        headers = {"Authorization": f"Bearer {api_key}"}
         extra_headers = self._parse_json_config("extra_headers")
-        if extra_headers:
-            protected = {"authorization", "content-type"}
-            for key, value in extra_headers.items():
-                if str(key).lower() not in protected:
-                    headers[str(key)] = str(value)
+        headers = build_headers(api_key, extra_headers or None)
 
         # 获取代理配置
         proxy = self.config.get("proxy", "").strip() or None
@@ -382,24 +389,20 @@ class GrokSearchPlugin(Star):
             images: Optional list of base64-encoded images for multimodal queries
         """
         # 安全解析 timeout 配置
-        try:
-            timeout_val = self.config.get("timeout_seconds", 60)
-            timeout = float(timeout_val) if timeout_val is not None else 60.0
-            if timeout <= 0:
-                timeout = 60.0
-        except (ValueError, TypeError):
-            timeout = 60.0
+        timeout = safe_number(
+            self.config.get("timeout_seconds", 60),
+            60.0,
+            cast=float,
+            min_val=0.001,
+        )
 
         # 安全解析 thinking_budget 配置
-        try:
-            thinking_budget_val = self.config.get("thinking_budget", 32000)
-            thinking_budget = (
-                int(thinking_budget_val) if thinking_budget_val is not None else 32000
-            )
-            if thinking_budget < 0:
-                thinking_budget = 32000
-        except (ValueError, TypeError):
-            thinking_budget = 32000
+        thinking_budget = safe_number(
+            self.config.get("thinking_budget", 32000),
+            32000,
+            cast=int,
+            min_val=0,
+        )
 
         # 重试配置（仅指令调用时使用）
         max_retries = 0
@@ -414,174 +417,175 @@ class GrokSearchPlugin(Star):
             if retryable_codes and isinstance(retryable_codes, list):
                 retryable_status_codes = set(retryable_codes)
 
-        # 自定义系统提示词
-        custom_prompt = self.config.get("custom_system_prompt", "")
-        if custom_prompt and isinstance(custom_prompt, str) and custom_prompt.strip():
-            # 如果有自定义提示词且没有传入其他提示词，使用配置中的自定义提示词
-            if system_prompt is None:
-                system_prompt = custom_prompt.strip()
-        # 如果仍然没有系统提示词，使用默认的 JSON 系统提示词
+        # 自定义系统提示词（传入优先，其次配置，最后默认 JSON 提示词）
         if system_prompt is None:
-            system_prompt = DEFAULT_JSON_SYSTEM_PROMPT
-        # 如果启用了使用 AstrBot 自带供应商，通过 AstrBot provider 接口调用
+            system_prompt = resolve_system_prompt(
+                self.config.get("custom_system_prompt", ""),
+                DEFAULT_JSON_SYSTEM_PROMPT,
+            )
+
         if self.config.get("use_builtin_provider", False):
-            attempts = 0
-            last_exc = None
-            started = time.time()
-            while True:
-                try:
-                    # 严格按配置获取 provider
-                    configured_provider_id = self.config.get("provider", "")
-                    if not configured_provider_id:
-                        return {
-                            "ok": False,
-                            "error": "启用了内置供应商但未选择供应商，请在插件设置中选择一个 LLM 供应商",
-                        }
-                    prov = self.context.get_provider_by_id(configured_provider_id)
-                    if not prov:
-                        return {
-                            "ok": False,
-                            "error": f"未找到配置的供应商: {configured_provider_id}",
-                        }
+            return await self._do_search_via_builtin_provider(
+                query=query,
+                system_prompt=system_prompt,
+                images=images,
+                use_retry=use_retry,
+                max_retries=max_retries,
+                retry_delay=retry_delay,
+            )
 
-                    provider_id = prov.meta().id
+        return await self._do_search_via_http(
+            query=query,
+            system_prompt=system_prompt,
+            images=images,
+            timeout=timeout,
+            thinking_budget=thinking_budget,
+            max_retries=max_retries,
+            retry_delay=retry_delay,
+            retryable_status_codes=retryable_status_codes,
+        )
 
-                    # 将 base64 图片转为内置供应商的 image_urls 格式
-                    image_urls = (
-                        [f"base64://{img}" for img in images] if images else None
-                    )
+    async def _do_search_via_builtin_provider(
+        self,
+        *,
+        query: str,
+        system_prompt: str,
+        images: list[str] | None,
+        use_retry: bool,
+        max_retries: int,
+        retry_delay: float,
+    ) -> dict:
+        """通过 AstrBot 自带 LLM 供应商执行搜索。"""
+        attempts = 0
+        started = time.time()
+        while True:
+            try:
+                # 严格按配置获取 provider
+                configured_provider_id = self.config.get("provider", "")
+                if not configured_provider_id:
+                    return {
+                        "ok": False,
+                        "error": "启用了内置供应商但未选择供应商，请在插件设置中选择一个 LLM 供应商",
+                    }
+                prov = self.context.get_provider_by_id(configured_provider_id)
+                if not prov:
+                    return {
+                        "ok": False,
+                        "error": f"未找到配置的供应商: {configured_provider_id}",
+                    }
 
-                    llm_resp = await self.context.llm_generate(
-                        chat_provider_id=provider_id,
-                        prompt=query,
-                        system_prompt=system_prompt,
-                        image_urls=image_urls,
-                    )
+                provider_id = prov.meta().id
 
-                    text = llm_resp.completion_text or ""
-                    usage = {}
-                    if llm_resp.usage:
-                        usage = {
-                            "prompt_tokens": llm_resp.usage.input,
-                            "completion_tokens": llm_resp.usage.output,
-                            "total_tokens": llm_resp.usage.total,
-                        }
+                # 将 base64 图片转为内置供应商的 image_urls 格式
+                image_urls = [f"base64://{img}" for img in images] if images else None
 
-                    # 尝试解析 JSON 格式响应
-                    parsed = self._try_parse_json_response(text)
-                    if parsed is not None:
-                        content = str(parsed.get("content", ""))
-                        raw_sources = parsed.get("sources", [])
-                        sources = self._normalize_sources(raw_sources)
-                        return {
-                            "ok": True,
-                            "content": content,
-                            "sources": sources,
-                            "elapsed_ms": int((time.time() - started) * 1000),
-                            "retries": attempts,
-                            "usage": usage,
-                            "raw": "",
-                        }
+                llm_resp = await self.context.llm_generate(
+                    chat_provider_id=provider_id,
+                    prompt=query,
+                    system_prompt=system_prompt,
+                    image_urls=image_urls,
+                )
 
-                    # JSON 解析失败，降级处理：提取纯文本和 URL
-                    logger.warning(
-                        f"[{PLUGIN_NAME}] 内置供应商返回非 JSON 格式，使用降级处理"
-                    )
+                text = llm_resp.completion_text or ""
+                usage = {}
+                if llm_resp.usage:
+                    usage = {
+                        "prompt_tokens": llm_resp.usage.input,
+                        "completion_tokens": llm_resp.usage.output,
+                        "total_tokens": llm_resp.usage.total,
+                    }
 
-                    # 检测典型错误模式，避免将错误文案误判为成功
-                    text_lower = text.lower()
-                    error_patterns = [
-                        "rate limit",
-                        "too many requests",
-                        "quota exceeded",
-                        "authentication failed",
-                        "invalid api key",
-                        "unauthorized",
-                        "service unavailable",
-                        "internal server error",
-                        "timeout",
-                        "connection refused",
-                    ]
-                    is_error_response = any(p in text_lower for p in error_patterns)
-
-                    if not text.strip() or is_error_response:
-                        error_msg = (
-                            "提供商返回空响应"
-                            if not text.strip()
-                            else f"提供商返回错误: {text[:200]}"
-                        )
-                        return {
-                            "ok": False,
-                            "error": error_msg,
-                            "content": "",
-                            "sources": [],
-                            "elapsed_ms": int((time.time() - started) * 1000),
-                            "retries": attempts,
-                            "usage": usage,
-                            "raw": text[:500] if text else "",
-                        }
-
-                    sources = self._extract_sources_from_text(text)
+                # 尝试解析 JSON 格式响应
+                parsed = parse_json_object(text)
+                if parsed is not None:
+                    content = str(parsed.get("content", ""))
+                    raw_sources = parsed.get("sources", [])
+                    sources = normalize_sources(raw_sources)
                     return {
                         "ok": True,
-                        "content": text,
+                        "content": content,
                         "sources": sources,
                         "elapsed_ms": int((time.time() - started) * 1000),
                         "retries": attempts,
                         "usage": usage,
-                        "raw": text,
+                        "raw": "",
                     }
 
-                except Exception as e:
-                    last_exc = e
-                    attempts += 1
-                    if not use_retry or attempts > max_retries:
-                        return {"ok": False, "error": str(last_exc)}
-                    await asyncio.sleep(retry_delay * attempts)
-
-        # 否则使用 HTTP 客户端向外部 Grok API 发起请求
-        try:
-            # 获取代理配置
-            proxy = self.config.get("proxy", "").strip() or None
-
-            # 根据配置选择 API 模式
-            if self.config.get("use_responses_api", False):
-                # 使用 xAI Responses API（/v1/responses）
-                result = await grok_responses_search(
-                    query=query,
-                    base_url=self.config.get("base_url", ""),
-                    api_key=self.config.get("api_key", ""),
-                    model=self.config.get("model", "grok-4-fast"),
-                    timeout=timeout,
-                    extra_body=self._parse_json_config("extra_body"),
-                    extra_headers=self._parse_json_config("extra_headers"),
-                    session=self._session,
-                    system_prompt=system_prompt,
-                    max_retries=max_retries,
-                    retry_delay=retry_delay,
-                    retryable_status_codes=retryable_status_codes,
-                    images=images,
-                    proxy=proxy,
+                # JSON 解析失败，降级处理：提取纯文本和 URL
+                logger.warning(
+                    f"[{PLUGIN_NAME}] 内置供应商返回非 JSON 格式，使用降级处理"
                 )
+
+                if not text.strip():
+                    return {
+                        "ok": False,
+                        "error": "提供商返回空响应",
+                        "content": "",
+                        "sources": [],
+                        "elapsed_ms": int((time.time() - started) * 1000),
+                        "retries": attempts,
+                        "usage": usage,
+                        "raw": "",
+                    }
+
+                sources = self._extract_sources_from_text(text)
+                return {
+                    "ok": True,
+                    "content": text,
+                    "sources": sources,
+                    "elapsed_ms": int((time.time() - started) * 1000),
+                    "retries": attempts,
+                    "usage": usage,
+                    "raw": text,
+                }
+
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                attempts += 1
+                if not use_retry or attempts > max_retries:
+                    return {"ok": False, "error": str(e)}
+                await asyncio.sleep(retry_delay * attempts)
+
+    async def _do_search_via_http(
+        self,
+        *,
+        query: str,
+        system_prompt: str,
+        images: list[str] | None,
+        timeout: float,
+        thinking_budget: int,
+        max_retries: int,
+        retry_delay: float,
+        retryable_status_codes: set[int] | None,
+    ) -> dict:
+        """通过外部 Grok HTTP API 执行搜索。"""
+        try:
+            proxy = self.config.get("proxy", "").strip() or None
+            common_kwargs = {
+                "query": query,
+                "base_url": self.config.get("base_url", ""),
+                "api_key": self.config.get("api_key", ""),
+                "model": self.config.get("model", DEFAULT_MODEL),
+                "timeout": timeout,
+                "extra_body": self._parse_json_config("extra_body"),
+                "extra_headers": self._parse_json_config("extra_headers"),
+                "session": self._session,
+                "system_prompt": system_prompt,
+                "max_retries": max_retries,
+                "retry_delay": retry_delay,
+                "retryable_status_codes": retryable_status_codes,
+                "images": images,
+                "proxy": proxy,
+            }
+
+            if self.config.get("use_responses_api", False):
+                result = await grok_responses_search(**common_kwargs)
             else:
-                # 使用 Chat Completions API（/v1/chat/completions）
                 result = await grok_search(
-                    query=query,
-                    base_url=self.config.get("base_url", ""),
-                    api_key=self.config.get("api_key", ""),
-                    model=self.config.get("model", "grok-4-fast"),
-                    timeout=timeout,
                     enable_thinking=self.config.get("enable_thinking", True),
                     thinking_budget=thinking_budget,
-                    extra_body=self._parse_json_config("extra_body"),
-                    extra_headers=self._parse_json_config("extra_headers"),
-                    session=self._session,
-                    system_prompt=system_prompt,
-                    max_retries=max_retries,
-                    retry_delay=retry_delay,
-                    retryable_status_codes=retryable_status_codes,
-                    images=images,
-                    proxy=proxy,
+                    **common_kwargs,
                 )
         except Exception as e:
             logger.error(f"[{PLUGIN_NAME}] API 调用异常: {e}")
@@ -593,6 +597,37 @@ class GrokSearchPlugin(Star):
             )
         return result
 
+    def _render_sources(
+        self,
+        sources: list,
+        *,
+        header: str,
+        with_snippet: bool,
+    ) -> list[str]:
+        """渲染来源列表，遵循 show_sources / max_sources 配置。"""
+        if not self.config.get("show_sources", False) or not sources:
+            return []
+        max_sources = self.config.get("max_sources", 5)
+        if max_sources > 0:
+            sources = sources[:max_sources]
+        lines = [f"\n{header}:"]
+        for i, src in enumerate(sources, 1):
+            url = src.get("url", "")
+            title = src.get("title", "")
+            if title:
+                if with_snippet:
+                    lines.append(f"  {i}. {title}")
+                    lines.append(f"     {url}")
+                else:
+                    lines.append(f"  {i}. {title}\n     {url}")
+            else:
+                lines.append(f"  {i}. {url}")
+            if with_snippet:
+                snippet = src.get("snippet", "")
+                if snippet:
+                    lines.append(f"     {snippet}")
+        return lines
+
     def _format_result(self, result: dict) -> str:
         """格式化搜索结果为用户友好的消息"""
         if not result.get("ok"):
@@ -603,22 +638,8 @@ class GrokSearchPlugin(Star):
         sources = result.get("sources", [])
         elapsed = result.get("elapsed_ms", 0) / 1000
 
-        show_sources = self.config.get("show_sources", False)
-        max_sources = self.config.get("max_sources", 5)
-
         lines = [content]
-
-        if show_sources and sources:
-            if max_sources > 0:
-                sources = sources[:max_sources]
-            lines.append("\n来源:")
-            for i, src in enumerate(sources, 1):
-                url = src.get("url", "")
-                title = src.get("title", "")
-                if title:
-                    lines.append(f"  {i}. {title}\n     {url}")
-                else:
-                    lines.append(f"  {i}. {url}")
+        lines.extend(self._render_sources(sources, header="来源", with_snippet=False))
 
         # 显示耗时、重试次数和 token 用量
         retry_info = ""
@@ -646,145 +667,19 @@ class GrokSearchPlugin(Star):
         content = result.get("content", "")
         sources = result.get("sources", [])
 
-        show_sources = self.config.get("show_sources", False)
-        max_sources = self.config.get("max_sources", 5)
-
         lines = [f"搜索结果:\n{content}"]
-
-        if show_sources and sources:
-            if max_sources > 0:
-                sources = sources[:max_sources]
-            lines.append("\n参考来源:")
-            for i, src in enumerate(sources, 1):
-                url = src.get("url", "")
-                title = src.get("title", "")
-                snippet = src.get("snippet", "")
-                if title:
-                    lines.append(f"  {i}. {title}")
-                    lines.append(f"     {url}")
-                else:
-                    lines.append(f"  {i}. {url}")
-                if snippet:
-                    lines.append(f"     {snippet}")
+        lines.extend(
+            self._render_sources(sources, header="参考来源", with_snippet=True)
+        )
 
         # 提示主 LLM 使用纯文本格式回复用户
         lines.append("\n[提示: 请使用纯文本格式回复用户，不要使用 Markdown 格式]")
 
         return "\n".join(lines)
 
-    def _try_parse_json_response(self, text: str) -> dict | None:
-        """尝试解析 JSON 响应，支持多种格式
-
-        支持的格式：
-        1. 纯 JSON 对象
-        2. Markdown 代码块包裹的 JSON
-        3. 混合文本中的 JSON（支持嵌套结构）
-        """
-
-        if not text or not text.strip():
-            return None
-
-        text = text.strip()
-
-        # 尝试直接解析
-        if text.startswith("{") and text.endswith("}"):
-            try:
-                parsed = json.loads(text)
-                if isinstance(parsed, dict):
-                    return parsed
-            except json.JSONDecodeError:
-                pass
-
-        # 尝试提取 Markdown 代码块中的 JSON
-        code_block_pattern = r"```(?:json)?\s*\n?([\s\S]*?)\n?```"
-        matches = re.findall(code_block_pattern, text)
-        for match in matches:
-            try:
-                parsed = json.loads(match.strip())
-                if isinstance(parsed, dict):
-                    return parsed
-            except json.JSONDecodeError:
-                continue
-
-        # 使用 JSONDecoder.raw_decode 从每个 { 起点尝试解码（支持嵌套结构）
-        decoder = json.JSONDecoder()
-        start_idx = 0
-        max_attempts = 10  # 限制尝试次数
-
-        while start_idx < len(text) and max_attempts > 0:
-            brace_pos = text.find("{", start_idx)
-            if brace_pos == -1:
-                break
-
-            try:
-                parsed, end_idx = decoder.raw_decode(text, idx=brace_pos)
-                if isinstance(parsed, dict) and (
-                    "content" in parsed or "sources" in parsed
-                ):
-                    return parsed
-                start_idx = end_idx
-            except json.JSONDecodeError:
-                start_idx = brace_pos + 1
-
-            max_attempts -= 1
-
-        return None
-
-    def _normalize_sources(self, raw_sources: list) -> list[dict[str, str]]:
-        """归一化 sources 结构，仅允许 http/https 协议"""
-        from urllib.parse import urlparse
-
-        sources = []
-        if isinstance(raw_sources, list):
-            for item in raw_sources:
-                if isinstance(item, dict) and item.get("url"):
-                    url = str(item.get("url", ""))
-                    # URL 协议白名单校验
-                    try:
-                        parsed = urlparse(url)
-                        if parsed.scheme not in ("http", "https"):
-                            continue
-                        # 限制长度和过滤控制字符
-                        if len(url) > 2048 or any(ord(c) < 32 for c in url):
-                            continue
-                    except Exception:
-                        continue
-
-                    sources.append(
-                        {
-                            "url": url,
-                            "title": str(item.get("title") or ""),
-                            "snippet": str(item.get("snippet") or ""),
-                        }
-                    )
-        return sources
-
     def _extract_sources_from_text(self, text: str) -> list[dict[str, str]]:
         """从文本中提取 URL 作为来源，仅允许 http/https 协议"""
-        from urllib.parse import urlparse
-
-        sources = []
-        url_pattern = r"https://[^\s)\]}>\"']+|http://[^\s)\]}>\"']+"
-        seen: set[str] = set()
-
-        for match in re.finditer(url_pattern, text):
-            url = match.group().rstrip(".,;:!?\"'")
-            if not url or url in seen:
-                continue
-            # URL 校验
-            try:
-                parsed = urlparse(url)
-                if parsed.scheme not in ("http", "https"):
-                    continue
-                if len(url) > 2048 or any(ord(c) < 32 for c in url):
-                    continue
-            except Exception:
-                continue
-
-            seen.add(url)
-            sources.append({"url": url, "title": "", "snippet": ""})
-
-        return sources
+        return [{"url": url, "title": "", "snippet": ""} for url in extract_urls(text)]
 
     def _help_text(self) -> str:
         """返回帮助文本"""
@@ -798,7 +693,7 @@ class GrokSearchPlugin(Star):
         model = (
             "由供应商决定"
             if use_builtin
-            else (self.config.get("model", "grok-4-fast") or "默认")
+            else (self.config.get("model", DEFAULT_MODEL) or "默认")
         )
         has_custom_prompt = bool(
             (self.config.get("custom_system_prompt", "") or "").strip()
@@ -880,18 +775,17 @@ class GrokSearchPlugin(Star):
             query = "请搜索这张图片的内容"
 
         # 优先使用自定义提示词，未设置则使用内置提示词（英文指令 + JSON 格式 + 中文回复）
-        custom_prompt = self.config.get("custom_system_prompt", "")
-        if custom_prompt and isinstance(custom_prompt, str) and custom_prompt.strip():
-            cmd_system_prompt = custom_prompt.strip()
-        else:
-            cmd_system_prompt = (
+        cmd_system_prompt = resolve_system_prompt(
+            self.config.get("custom_system_prompt", ""),
+            (
                 "You are a web research assistant. Use live web search/browsing when answering. "
                 "Return ONLY a single JSON object with keys: "
                 "content (string), sources (array of objects with url/title/snippet when possible). "
                 "Keep content concise and evidence-backed. "
                 "IMPORTANT: Respond in Chinese. Do NOT use Markdown formatting in the content field - use plain text only. "
                 "Keep proper nouns and names in their original language."
-            )
+            ),
+        )
 
         result = await self._do_search(
             query,
@@ -906,55 +800,7 @@ class GrokSearchPlugin(Star):
         image_sent = False
 
         if use_image and result.get("ok"):
-            content = result.get("content", "")
-            sources = result.get("sources", [])
-            elapsed = result.get("elapsed_ms", 0)
-            usage = result.get("usage") or {}
-            total_tokens = usage.get("total_tokens", 0)
-            model = self.config.get("model", "")
-            theme = self.config.get("card_theme", "auto")
-
-            import tempfile
-
-            tmp_path = None
-            try:
-                with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
-                    tmp_path = tmp.name
-                render_search_card(
-                    content=content,
-                    model=model,
-                    elapsed_ms=elapsed,
-                    total_tokens=total_tokens,
-                    output_path=tmp_path,
-                    theme=theme,
-                )
-                await event.send(MessageChain().file_image(tmp_path))
-                image_sent = True
-            except Exception as e:
-                logger.warning(f"[{PLUGIN_NAME}] 图片卡片发送失败，降级为文本: {e}")
-            finally:
-                if tmp_path and os.path.exists(tmp_path):
-                    os.remove(tmp_path)
-
-            # 来源链接单独以文本发送（可点击/复制）
-            if image_sent:
-                show_sources = self.config.get("show_sources", False)
-                max_sources = self.config.get("max_sources", 5)
-                if show_sources and sources:
-                    if max_sources > 0:
-                        sources = sources[:max_sources]
-                    src_lines = ["来源:"]
-                    for i, src in enumerate(sources, 1):
-                        url = src.get("url", "")
-                        title = src.get("title", "")
-                        if title:
-                            src_lines.append(f"  {i}. {title}\n     {url}")
-                        else:
-                            src_lines.append(f"  {i}. {url}")
-                    try:
-                        await event.send(MessageChain().message("\n".join(src_lines)))
-                    except Exception as e:
-                        logger.warning(f"[{PLUGIN_NAME}] 来源链接发送失败: {e}")
+            image_sent = await self._send_as_image_card(event, result)
 
         # 文本模式或图片发送失败时降级
         if not image_sent:
@@ -962,6 +808,54 @@ class GrokSearchPlugin(Star):
                 await event.send(MessageChain().message(self._format_result(result)))
             except Exception as e:
                 logger.warning(f"[{PLUGIN_NAME}] 发送搜索结果失败: {e}")
+
+    async def _send_as_image_card(self, event: AstrMessageEvent, result: dict) -> bool:
+        """将搜索结果渲染为图片卡片并发送，附带文本来源链接。
+
+        返回 True 表示图片已发送（来源链接以文本形式分开发送）；
+        返回 False 表示渲染或发送失败，调用方应降级为文本模式。
+        """
+        content = result.get("content", "")
+        sources = result.get("sources", [])
+        elapsed = result.get("elapsed_ms", 0)
+        usage = result.get("usage") or {}
+        total_tokens = usage.get("total_tokens", 0)
+        model = self.config.get("model", "")
+        theme = self.config.get("card_theme", "auto")
+
+        tmp_path: str | None = None
+        image_sent = False
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+                tmp_path = tmp.name
+            render_search_card(
+                content=content,
+                model=model,
+                elapsed_ms=elapsed,
+                total_tokens=total_tokens,
+                output_path=tmp_path,
+                theme=theme,
+            )
+            await event.send(MessageChain().file_image(tmp_path))
+            image_sent = True
+        except Exception as e:
+            logger.warning(f"[{PLUGIN_NAME}] 图片卡片发送失败，降级为文本: {e}")
+        finally:
+            if tmp_path:
+                Path(tmp_path).unlink(missing_ok=True)
+
+        # 来源链接单独以文本发送（可点击/复制）
+        if image_sent:
+            src_lines = self._render_sources(sources, header="来源", with_snippet=False)
+            if src_lines:
+                try:
+                    # _render_sources 返回的首行带前导换行，去掉以避免空行
+                    text = "\n".join(src_lines).lstrip("\n")
+                    await event.send(MessageChain().message(text))
+                except Exception as e:
+                    logger.warning(f"[{PLUGIN_NAME}] 来源链接发送失败: {e}")
+
+        return image_sent
 
     @filter.llm_tool(name="grok_web_search")
     async def grok_tool(
@@ -1052,7 +946,7 @@ class GrokSearchPlugin(Star):
 
         base_url = self.config.get("base_url", "")
         api_key = self.config.get("api_key", "")
-        model = self.config.get("model", "grok-4-fast")
+        model = self.config.get("model", DEFAULT_MODEL)
         timeout = self.config.get("timeout_seconds", 60)
         proxy = self.config.get("proxy", "") or None
 
@@ -1108,7 +1002,17 @@ class GrokSearchPlugin(Star):
             logger.error(f"[{PLUGIN_NAME}] on_astrbot_loaded 处理失败: {e}")
 
     async def terminate(self):
-        """插件销毁：关闭 HTTP 会话"""
+        """插件销毁：等待后台字体任务（不可取消）并关闭 HTTP 会话。
+
+        注意：``_font_init_task`` 包装的是 ``asyncio.to_thread`` 调用，
+        取消 Task 不会终止底层线程，因此这里只 detach，让线程自行结束。
+        """
+        if self._font_init_task and self._font_init_task.done():
+            try:
+                await self._font_init_task
+            except Exception:
+                pass
+        self._font_init_task = None
         if self._session and not self._session.closed:
             await self._session.close()
             self._session = None

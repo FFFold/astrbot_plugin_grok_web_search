@@ -9,7 +9,8 @@
     "_special": "select_provider",
     "type": "string",
     "description": "选择要使用的 LLM 供应商",
-    "hint": "仅当启用自带供应商时生效,选择已配置的 LLM 供应商"
+    "hint": "仅当启用自带供应商时生效,选择已配置的 LLM 供应商",
+    "default": ""
   },
   "model": {
     "type": "string",
