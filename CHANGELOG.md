@@ -2,13 +2,26 @@
 
 本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
-## [Unreleased]
+## [1.4.1] - 2026-05-07
+
+### Added
+- **模型路由**：新增 `model_routes` 配置，可通过 `/ask <模型路由> <请求内容>` 为不同模型或供应商分别发起独立请求
 
 ### Changed
-- 将用户指令从 `/grok` 改为 `/ask`
-- 删除 `grok_web_search` 和 `grok_web_fetch` 两个 LLM Tool
-- 插件展示名与文档描述调整为与特定供应商无关的独立请求定位
-- `metadata.yaml` 的仓库地址更新为 `https://github.com/FFFold/astrbot_plugin_independent_ask`
+- **插件定位调整**：将用户指令从 `/grok` 改为 `/ask`，插件展示名与文档描述调整为与特定供应商无关的独立请求定位
+- **插件身份调整**：`metadata.yaml` 与持久化数据目录使用 `astrbot_plugin_independent_ask`，仓库地址更新为 `https://github.com/FFFold/astrbot_plugin_independent_ask`
+- **上游 v1.4.0 代码质量更新**：合入共享工具函数重构（`build_user_content`、`safe_number`、`resolve_system_prompt`、`is_safe_url` 等）、HTTP client 解析改进、CI 工作流更新和运行时依赖声明调整
+- **字体加载重构**：合入上游独立 `tool/font_loader.py`，支持自动发现最新版字体、代理下载和更安全的 7z 路径解析
+- **引用消息解析增强**：优先使用 AstrBot 新版 `quoted_message_parser`，失败时回退旧版 `chain_parser`
+- **图片 Base64 转换重构**：统一处理 `Image` 组件、`base64://`、`data:image/`、`http(s)://` 和本地路径来源
+
+### Removed
+- 删除 `grok_web_search` 和 `grok_web_fetch` 两个 LLM Tool，保留 `/ask` 独立请求入口
+- 删除 Skill 安装/卸载逻辑与 `skill/scripts/grok_search.py`，避免与独立请求定位冲突
+
+### Fixed
+- 修复 `/ask <模型路由> <请求内容>` 在 AstrBot 指令解析只传入首个 token 时丢失完整请求文本的问题，支持空格、制表符和多行输入
+- 修复合并上游后遗留的 fetch helper 导入问题，移除未使用的 `grok_fetch` / `FETCH_SYSTEM_PROMPT` 残留
 
 ## [1.3.1] - 2026-04-12
 
