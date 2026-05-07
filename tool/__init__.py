@@ -2,7 +2,6 @@
 
 from .tool import (
     DEFAULT_MODEL,
-    FETCH_SYSTEM_PROMPT,
     build_headers,
     build_user_content,
     coerce_json_object,
@@ -26,7 +25,6 @@ from .tool import (
 
 __all__ = [
     "DEFAULT_MODEL",
-    "FETCH_SYSTEM_PROMPT",
     "build_headers",
     "build_user_content",
     "coerce_json_object",

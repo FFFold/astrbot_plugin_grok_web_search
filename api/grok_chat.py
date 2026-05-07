@@ -12,8 +12,6 @@ import aiohttp
 
 from ..tool.tool import (
     DEFAULT_JSON_SYSTEM_PROMPT,
-    DEFAULT_MODEL,
-    FETCH_SYSTEM_PROMPT,
     IMAGE_UNSUPPORTED_ERROR,
     build_headers,
     build_user_content,
@@ -279,64 +277,4 @@ async def grok_search(
         "usage": data.get("usage") or {},
         "elapsed_ms": int((time.time() - started) * 1000),
         "retries": retry_count,
-    }
-
-
-async def grok_fetch(
-    url: str,
-    base_url: str,
-    api_key: str,
-    model: str = DEFAULT_MODEL,
-    timeout: float = 60.0,
-    extra_body: dict | None = None,
-    extra_headers: dict | None = None,
-    session: aiohttp.ClientSession | None = None,
-    proxy: str | None = None,
-) -> dict[str, Any]:
-    """利用 Grok 联网能力抓取指定 URL 的网页内容并转为 Markdown
-
-    Args:
-        url: 要抓取的网页 URL
-        base_url: Grok API 端点
-        api_key: API 密钥
-        model: 模型名称
-        timeout: 超时时间（秒）
-        extra_body: 额外请求体参数
-        extra_headers: 额外请求头
-        session: 可选 aiohttp.ClientSession
-        proxy: 代理地址
-
-    Returns:
-        {
-            "ok": bool,
-            "content": str,      # Markdown 格式的网页内容
-            "error": str,        # 错误信息（失败时）
-            "elapsed_ms": int,
-        }
-    """
-    result = await grok_search(
-        query=f"{url}\n获取该网页内容并返回其结构化 Markdown 格式",
-        base_url=base_url,
-        api_key=api_key,
-        model=model,
-        timeout=timeout,
-        enable_thinking=False,
-        thinking_budget=0,
-        extra_body=extra_body,
-        extra_headers=extra_headers,
-        session=session,
-        system_prompt=FETCH_SYSTEM_PROMPT,
-        max_retries=2,
-        proxy=proxy,
-    )
-
-    if not result.get("ok"):
-        return result
-
-    content = result.get("raw") or result.get("content", "")
-
-    return {
-        "ok": True,
-        "content": content,
-        "elapsed_ms": result.get("elapsed_ms", 0),
     }
