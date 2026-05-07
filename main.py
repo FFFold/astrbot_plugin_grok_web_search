@@ -6,9 +6,9 @@ AstrBot 插件：独立 LLM 请求
 """
 
 import asyncio
-import json
 import os
 import re
+import tempfile
 import time
 from pathlib import Path
 
@@ -30,14 +30,30 @@ from .tool.card_render import init_fonts, render_search_card
 from .tool.card_render import set_logger as set_card_logger
 
 try:
+    from astrbot.core.utils.quoted_message_parser import (
+        extract_quoted_message_images as _extract_quoted_message_images,
+    )
+    from astrbot.core.utils.quoted_message_parser import (
+        extract_quoted_message_text as _extract_quoted_message_text,
+    )
+except ImportError:
+    _extract_quoted_message_images = None
+    _extract_quoted_message_text = None
+try:
     from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 except ImportError:
     get_astrbot_data_path = None
 from .tool.tool import (
     DEFAULT_JSON_SYSTEM_PROMPT,
+    build_headers,
+    extract_urls,
     normalize_api_key,
     normalize_base_url,
+    normalize_sources,
     parse_json_config,
+    parse_json_object,
+    resolve_system_prompt,
+    safe_number,
 )
 
 PLUGIN_NAME = "astrbot_plugin_independent_ask"
@@ -63,6 +79,7 @@ class GrokSearchPlugin(Star):
         self.config = config or {}
         self._session: aiohttp.ClientSession | None = None
         self._card_fonts_ready = False
+        self._font_init_task: asyncio.Task | None = None
         self._model_route_index: dict[str, dict] | None = None
 
     @staticmethod
@@ -272,8 +289,8 @@ class GrokSearchPlugin(Star):
     ) -> tuple[str | None, list[str]]:
         """Extract text and images from the user's message.
 
-        Reuses AstrBot core's chain_parser for text/image extraction from
-        Reply, Node, Nodes, Forward, etc.
+        Prefer AstrBot core's public quoted_message_parser for Reply/forward
+        fallback parsing. Older cores fall back to chain_parser helpers.
 
         Returns:
             A tuple of (text, images):
@@ -281,54 +298,81 @@ class GrokSearchPlugin(Star):
             - images: list of base64-encoded image strings (without prefix)
         """
         chain = event.get_messages()
+        text: str | None = None
+        image_refs: list[str] = []
 
-        # 使用本体的 chain_parser 提取文本（处理 Reply/Node/Nodes/Forward）
-        text = _extract_text_from_component_chain(chain)
+        use_legacy_parser = True
+        if (
+            _extract_quoted_message_text is not None
+            and _extract_quoted_message_images is not None
+        ):
+            try:
+                text = await _extract_quoted_message_text(event)
+                image_refs = await _extract_quoted_message_images(event)
+                use_legacy_parser = not text and not image_refs
+            except Exception as e:
+                logger.warning(
+                    f"[{PLUGIN_NAME}] quoted_message_parser failed, falling back to chain_parser: {e}"
+                )
 
-        # 使用本体的 chain_parser 提取图片引用，再转为 base64
-        image_refs = _extract_image_refs_from_component_chain(chain)
+        if use_legacy_parser:
+            text = _extract_text_from_component_chain(chain)
+            image_refs = _extract_image_refs_from_component_chain(chain)
+
         images: list[str] = []
         seen: set[str] = set()
 
         # 提取消息链顶层的 Image 组件并转为 base64
         for comp in chain:
             if isinstance(comp, Image):
-                try:
-                    b64 = await comp.convert_to_base64()
-                    if b64 and b64 not in seen:
-                        seen.add(b64)
-                        images.append(b64)
-                except Exception as e:
-                    logger.warning(
-                        f"[{PLUGIN_NAME}] Failed to convert image to base64: {e}"
-                    )
+                await self._append_image_base64(comp, images, seen)
 
         # 将嵌套组件中的图片引用（URL/路径）转为 base64
         for ref in image_refs:
-            try:
-                img = Image.fromURL(ref)
-                b64 = await img.convert_to_base64()
-                if b64 and b64 not in seen:
-                    seen.add(b64)
-                    images.append(b64)
-            except Exception as e:
-                logger.warning(
-                    f"[{PLUGIN_NAME}] Failed to convert image ref to base64: {e}"
-                )
+            await self._append_image_base64(ref, images, seen)
 
         return text, images
+
+    async def _append_image_base64(
+        self,
+        image: Image | str,
+        images: list[str],
+        seen: set[str],
+    ) -> None:
+        try:
+            if isinstance(image, Image):
+                b64 = await image.convert_to_base64()
+            else:
+                image_ref = image.strip()
+                if image_ref.startswith("base64://"):
+                    b64 = image_ref.removeprefix("base64://")
+                elif image_ref.startswith("data:image/"):
+                    b64 = image_ref.split(",", 1)[1] if "," in image_ref else ""
+                elif image_ref.startswith(("http://", "https://")):
+                    b64 = await Image.fromURL(image_ref).convert_to_base64()
+                else:
+                    b64 = await Image(file=image_ref).convert_to_base64()
+
+            b64 = b64.removeprefix("base64://")
+            if b64 and b64 not in seen:
+                seen.add(b64)
+                images.append(b64)
+        except Exception as e:
+            logger.warning(f"[{PLUGIN_NAME}] Failed to convert image to base64: {e}")
 
     def _init_fonts(self):
         """Initialize card rendering fonts (runs in background)."""
         logger.info(f"[{PLUGIN_NAME}] 正在后台初始化卡片渲染字体 ...")
         try:
+            from .tool import font_loader
+
+            font_loader.set_proxy(str(self.config.get("proxy", "")).strip() or None)
             if get_astrbot_data_path:
                 font_dir = str(
                     Path(get_astrbot_data_path()) / "plugin_data" / PLUGIN_NAME / "font"
                 )
             else:
                 font_dir = os.path.join(os.path.dirname(__file__), "font")
-            set_card_logger(logger)
             self._card_fonts_ready = init_fonts(font_dir)
             if self._card_fonts_ready:
                 logger.info(f"[{PLUGIN_NAME}] 卡片渲染字体已就绪: {font_dir}")
@@ -341,7 +385,10 @@ class GrokSearchPlugin(Star):
         """插件初始化：验证配置并准备运行时资源"""
         # 在后台初始化字体，仅在开启图片渲染模式下
         if self.config.get("render_as_image", False):
-            asyncio.get_event_loop().run_in_executor(None, self._init_fonts)
+            set_card_logger(logger)
+            self._font_init_task = asyncio.create_task(
+                asyncio.to_thread(self._init_fonts)
+            )
 
         enabled_routes = self._get_enabled_model_routes()
         route_count = len(enabled_routes)
@@ -401,13 +448,8 @@ class GrokSearchPlugin(Star):
 
         # 通过 v1/models 接口验证连通性和密钥有效性
         models_url = f"{base_url}/v1/models"
-        headers = {"Authorization": f"Bearer {api_key}"}
         extra_headers = self._parse_json_config("extra_headers", cfg)
-        if extra_headers:
-            protected = {"authorization", "content-type"}
-            for key, value in extra_headers.items():
-                if str(key).lower() not in protected:
-                    headers[str(key)] = str(value)
+        headers = build_headers(api_key, extra_headers or None)
 
         # 获取代理配置
         proxy = str(cfg.get("proxy", "")).strip() or None
@@ -494,47 +536,40 @@ class GrokSearchPlugin(Star):
         cfg = effective_config or self.config
 
         # 安全解析 timeout 配置
-        try:
-            timeout_val = cfg.get("timeout_seconds", 60)
-            timeout = float(timeout_val) if timeout_val is not None else 60.0
-            if timeout <= 0:
-                timeout = 60.0
-        except (ValueError, TypeError):
-            timeout = 60.0
+        timeout = safe_number(
+            cfg.get("timeout_seconds", 60),
+            60.0,
+            cast=float,
+            min_val=0.001,
+        )
 
         # 安全解析 thinking_budget 配置
-        try:
-            thinking_budget_val = cfg.get("thinking_budget", 32000)
-            thinking_budget = (
-                int(thinking_budget_val) if thinking_budget_val is not None else 32000
-            )
-            if thinking_budget < 0:
-                thinking_budget = 32000
-        except (ValueError, TypeError):
-            thinking_budget = 32000
+        thinking_budget = safe_number(
+            cfg.get("thinking_budget", 32000),
+            32000,
+            cast=int,
+            min_val=0,
+        )
 
         # 重试配置（仅指令调用时使用）
         max_retries = 0
         retry_delay = 1.0
         retryable_status_codes = None
         if use_retry:
-            max_retries = self.config.get("max_retries", 3)
-            retry_delay = self.config.get("retry_delay", 1.0)
+            max_retries = cfg.get("max_retries", 3)
+            retry_delay = cfg.get("retry_delay", 1.0)
 
             # 解析可重试状态码（直接从 list 类型配置获取）
-            retryable_codes = self.config.get("retryable_status_codes", [])
+            retryable_codes = cfg.get("retryable_status_codes", [])
             if retryable_codes and isinstance(retryable_codes, list):
                 retryable_status_codes = set(retryable_codes)
 
         # 自定义系统提示词
-        custom_prompt = cfg.get("custom_system_prompt", "")
-        if custom_prompt and isinstance(custom_prompt, str) and custom_prompt.strip():
-            # 如果有自定义提示词且没有传入其他提示词，使用配置中的自定义提示词
-            if system_prompt is None:
-                system_prompt = custom_prompt.strip()
-        # 如果仍然没有系统提示词，使用默认的 JSON 系统提示词
         if system_prompt is None:
-            system_prompt = DEFAULT_JSON_SYSTEM_PROMPT
+            system_prompt = resolve_system_prompt(
+                cfg.get("custom_system_prompt", ""),
+                DEFAULT_JSON_SYSTEM_PROMPT,
+            )
         # 如果启用了使用 AstrBot 自带供应商，通过 AstrBot provider 接口调用
         if cfg.get("use_builtin_provider", False):
             attempts = 0
@@ -580,11 +615,11 @@ class GrokSearchPlugin(Star):
                         }
 
                     # 尝试解析 JSON 格式响应
-                    parsed = self._try_parse_json_response(text)
+                    parsed = parse_json_object(text)
                     if parsed is not None:
                         content = str(parsed.get("content", ""))
                         raw_sources = parsed.get("sources", [])
-                        sources = self._normalize_sources(raw_sources)
+                        sources = normalize_sources(raw_sources)
                         return {
                             "ok": True,
                             "content": content,
@@ -784,119 +819,9 @@ class GrokSearchPlugin(Star):
 
         return "\n".join(lines)
 
-    def _try_parse_json_response(self, text: str) -> dict | None:
-        """尝试解析 JSON 响应，支持多种格式
-
-        支持的格式：
-        1. 纯 JSON 对象
-        2. Markdown 代码块包裹的 JSON
-        3. 混合文本中的 JSON（支持嵌套结构）
-        """
-
-        if not text or not text.strip():
-            return None
-
-        text = text.strip()
-
-        # 尝试直接解析
-        if text.startswith("{") and text.endswith("}"):
-            try:
-                parsed = json.loads(text)
-                if isinstance(parsed, dict):
-                    return parsed
-            except json.JSONDecodeError:
-                pass
-
-        # 尝试提取 Markdown 代码块中的 JSON
-        code_block_pattern = r"```(?:json)?\s*\n?([\s\S]*?)\n?```"
-        matches = re.findall(code_block_pattern, text)
-        for match in matches:
-            try:
-                parsed = json.loads(match.strip())
-                if isinstance(parsed, dict):
-                    return parsed
-            except json.JSONDecodeError:
-                continue
-
-        # 使用 JSONDecoder.raw_decode 从每个 { 起点尝试解码（支持嵌套结构）
-        decoder = json.JSONDecoder()
-        start_idx = 0
-        max_attempts = 10  # 限制尝试次数
-
-        while start_idx < len(text) and max_attempts > 0:
-            brace_pos = text.find("{", start_idx)
-            if brace_pos == -1:
-                break
-
-            try:
-                parsed, end_idx = decoder.raw_decode(text, idx=brace_pos)
-                if isinstance(parsed, dict) and (
-                    "content" in parsed or "sources" in parsed
-                ):
-                    return parsed
-                start_idx = end_idx
-            except json.JSONDecodeError:
-                start_idx = brace_pos + 1
-
-            max_attempts -= 1
-
-        return None
-
-    def _normalize_sources(self, raw_sources: list) -> list[dict[str, str]]:
-        """归一化 sources 结构，仅允许 http/https 协议"""
-        from urllib.parse import urlparse
-
-        sources = []
-        if isinstance(raw_sources, list):
-            for item in raw_sources:
-                if isinstance(item, dict) and item.get("url"):
-                    url = str(item.get("url", ""))
-                    # URL 协议白名单校验
-                    try:
-                        parsed = urlparse(url)
-                        if parsed.scheme not in ("http", "https"):
-                            continue
-                        # 限制长度和过滤控制字符
-                        if len(url) > 2048 or any(ord(c) < 32 for c in url):
-                            continue
-                    except Exception:
-                        continue
-
-                    sources.append(
-                        {
-                            "url": url,
-                            "title": str(item.get("title") or ""),
-                            "snippet": str(item.get("snippet") or ""),
-                        }
-                    )
-        return sources
-
     def _extract_sources_from_text(self, text: str) -> list[dict[str, str]]:
         """从文本中提取 URL 作为来源，仅允许 http/https 协议"""
-        from urllib.parse import urlparse
-
-        sources = []
-        url_pattern = r"https://[^\s)\]}>\"']+|http://[^\s)\]}>\"']+"
-        seen: set[str] = set()
-
-        for match in re.finditer(url_pattern, text):
-            url = match.group().rstrip(".,;:!?\"'")
-            if not url or url in seen:
-                continue
-            # URL 校验
-            try:
-                parsed = urlparse(url)
-                if parsed.scheme not in ("http", "https"):
-                    continue
-                if len(url) > 2048 or any(ord(c) < 32 for c in url):
-                    continue
-            except Exception:
-                continue
-
-            seen.add(url)
-            sources.append({"url": url, "title": "", "snippet": ""})
-
-        return sources
+        return [{"url": url, "title": "", "snippet": ""} for url in extract_urls(text)]
 
     def _help_text(self) -> str:
         """返回帮助文本"""
@@ -1041,18 +966,17 @@ class GrokSearchPlugin(Star):
             query = "请搜索这张图片的内容"
 
         # 优先使用自定义提示词，未设置则使用内置提示词（英文指令 + JSON 格式 + 中文回复）
-        custom_prompt = effective_config.get("custom_system_prompt", "")
-        if custom_prompt and isinstance(custom_prompt, str) and custom_prompt.strip():
-            cmd_system_prompt = custom_prompt.strip()
-        else:
-            cmd_system_prompt = (
+        cmd_system_prompt = resolve_system_prompt(
+            effective_config.get("custom_system_prompt", ""),
+            (
                 "You are a web research assistant. Use live web search/browsing when answering. "
                 "Return ONLY a single JSON object with keys: "
                 "content (string), sources (array of objects with url/title/snippet when possible). "
                 "Keep content concise and evidence-backed. "
                 "IMPORTANT: Respond in Chinese. Do NOT use Markdown formatting in the content field - use plain text only. "
                 "Keep proper nouns and names in their original language."
-            )
+            ),
+        )
 
         result = await self._do_search(
             query,
@@ -1076,8 +1000,6 @@ class GrokSearchPlugin(Star):
             model = effective_config.get("model", "")
             theme = self.config.get("card_theme", "auto")
 
-            import tempfile
-
             tmp_path = None
             try:
                 with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
@@ -1095,8 +1017,8 @@ class GrokSearchPlugin(Star):
             except Exception as e:
                 logger.warning(f"[{PLUGIN_NAME}] 图片卡片发送失败，降级为文本: {e}")
             finally:
-                if tmp_path and os.path.exists(tmp_path):
-                    os.remove(tmp_path)
+                if tmp_path:
+                    Path(tmp_path).unlink(missing_ok=True)
 
             # 来源链接单独以文本发送（可点击/复制）
             if image_sent:
@@ -1144,7 +1066,13 @@ class GrokSearchPlugin(Star):
             logger.error(f"[{PLUGIN_NAME}] on_astrbot_loaded 处理失败: {e}")
 
     async def terminate(self):
-        """插件销毁：关闭 HTTP 会话"""
+        """插件销毁：等待后台字体任务（不可取消）并关闭 HTTP 会话。"""
+        if self._font_init_task and self._font_init_task.done():
+            try:
+                await self._font_init_task
+            except Exception:
+                pass
+        self._font_init_task = None
         if self._session and not self._session.closed:
             await self._session.close()
             self._session = None

@@ -55,6 +55,9 @@ HTTP_ERROR_HINTS: dict[int, str] = {
 # 默认可重试的 HTTP 状态码
 DEFAULT_RETRYABLE_STATUS_CODES: set[int] = {429, 500, 502, 503, 504}
 
+# 默认模型名（与 _conf_schema.json 保持一致）
+DEFAULT_MODEL = "grok-4.1-fast"
+
 
 # ─── 工具函数 ─────────────────────────────────────────────
 
@@ -172,6 +175,81 @@ def normalize_image(b64_data: str) -> tuple[str, str] | None:
     return None  # 无法识别 → 拒绝
 
 
+def build_user_content(
+    text: str,
+    images: list[str] | None,
+    *,
+    kind: str,
+) -> Any:
+    """构建用户消息体，自动处理多模态。
+
+    - 无图片：返回纯文本字符串。
+    - 有图片：返回内容数组；遇到无法识别的图片格式时返回 IMAGE_UNSUPPORTED_ERROR。
+
+    kind:
+        - "chat":      OpenAI Chat Completions 多模态格式（type=text/image_url）
+        - "responses": xAI Responses API 多模态格式（type=input_text/input_image）
+    """
+    if not images:
+        return text
+
+    if kind == "chat":
+        text_part: dict[str, Any] = {"type": "text", "text": text}
+    elif kind == "responses":
+        text_part = {"type": "input_text", "text": text}
+    else:
+        raise ValueError(f"Unknown content kind: {kind!r}")
+
+    parts: list[dict[str, Any]] = [text_part]
+    for img_b64 in images:
+        normalized = normalize_image(img_b64)
+        if normalized is None:
+            return IMAGE_UNSUPPORTED_ERROR
+        mime, img_b64 = normalized
+        if kind == "chat":
+            parts.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{mime};base64,{img_b64}"},
+                }
+            )
+        else:
+            parts.append(
+                {
+                    "type": "input_image",
+                    "image_url": f"data:{mime};base64,{img_b64}",
+                    "detail": "high",
+                }
+            )
+    return parts
+
+
+def safe_number(
+    value: Any,
+    default: float | int,
+    *,
+    cast: type = float,
+    min_val: float | int | None = None,
+) -> Any:
+    """安全地把配置值转成数值；失败、None、低于下限时回退到 default。"""
+    try:
+        v = cast(value) if value is not None else default
+    except (ValueError, TypeError):
+        return default
+    if min_val is not None and v < min_val:
+        return default
+    return v
+
+
+def resolve_system_prompt(custom_prompt: Any, default_prompt: str) -> str:
+    """选择系统提示词：自定义优先（去掉空白），否则使用默认。"""
+    if isinstance(custom_prompt, str):
+        stripped = custom_prompt.strip()
+        if stripped:
+            return stripped
+    return default_prompt
+
+
 def normalize_api_key(api_key: str) -> str:
     """过滤占位符 API Key"""
     api_key = api_key.strip()
@@ -184,16 +262,8 @@ def normalize_api_key(api_key: str) -> str:
 
 
 def normalize_base_url(base_url: str) -> str:
-    """规范化 Base URL，移除尾部 / 和 /v1"""
-    base_url = base_url.strip().rstrip("/")
-    if base_url.endswith("/v1"):
-        return base_url[: -len("/v1")]
-    return base_url
-
-
-def normalize_base_url_value(base_url: str) -> str:
-    """过滤占位符 Base URL"""
-    base_url = base_url.strip()
+    """规范化 Base URL：过滤占位符、去尾 / 和 /v1。空/占位符返回 ""。"""
+    base_url = (base_url or "").strip()
     if not base_url:
         return ""
     placeholder = {
@@ -205,33 +275,121 @@ def normalize_base_url_value(base_url: str) -> str:
     }
     if base_url.upper() in placeholder:
         return ""
+    base_url = base_url.rstrip("/")
+    if base_url.endswith("/v1"):
+        base_url = base_url[: -len("/v1")]
     return base_url
 
 
-def coerce_json_object(text: str) -> dict[str, Any] | None:
-    """尝试将字符串解析为 JSON 对象"""
-    text = text.strip()
-    if not text:
+# 兼容别名（旧名义为"过滤占位符"，新版统一行为）
+def normalize_base_url_value(base_url: str) -> str:
+    """已合并到 normalize_base_url，保留以兼容外部调用。"""
+    return normalize_base_url(base_url)
+
+
+def parse_json_object(text: str) -> dict[str, Any] | None:
+    """尝试从字符串中解析出 JSON 对象（增强版）。
+
+    支持：
+    1. 纯 JSON 对象
+    2. Markdown 代码块包裹的 JSON
+    3. 混合文本中的 JSON（含嵌套结构，优先返回含 content/sources 的对象）
+    """
+    if not text or not text.strip():
         return None
+    text = text.strip()
+
+    # 1) 纯 JSON
     if text.startswith("{") and text.endswith("}"):
         try:
             value = json.loads(text)
-            return value if isinstance(value, dict) else None
+            if isinstance(value, dict):
+                return value
         except json.JSONDecodeError:
-            return None
+            pass
+
+    # 2) Markdown 代码块
+    for match in re.findall(r"```(?:json)?\s*\n?([\s\S]*?)\n?```", text):
+        try:
+            value = json.loads(match.strip())
+            if isinstance(value, dict):
+                return value
+        except json.JSONDecodeError:
+            continue
+
+    # 3) 混合文本，从每个 { 起点尝试解码，优先含 content/sources 的对象
+    decoder = json.JSONDecoder()
+    start_idx = 0
+    max_attempts = 10
+    while start_idx < len(text) and max_attempts > 0:
+        brace_pos = text.find("{", start_idx)
+        if brace_pos == -1:
+            break
+        try:
+            value, end_idx = decoder.raw_decode(text, idx=brace_pos)
+            if isinstance(value, dict) and ("content" in value or "sources" in value):
+                return value
+            start_idx = end_idx
+        except json.JSONDecodeError:
+            start_idx = brace_pos + 1
+        max_attempts -= 1
+
     return None
 
 
-def extract_urls(text: str) -> list[str]:
-    """从文本中提取 URL"""
+def coerce_json_object(text: str) -> dict[str, Any] | None:
+    """已合并到 parse_json_object，保留以兼容外部调用。"""
+    return parse_json_object(text)
+
+
+def normalize_sources(raw_sources: Any) -> list[dict[str, str]]:
+    """归一化 sources 列表：仅保留 url 安全且为 dict 的条目。"""
+    sources: list[dict[str, str]] = []
+    if not isinstance(raw_sources, list):
+        return sources
+    for item in raw_sources:
+        if not isinstance(item, dict) or not item.get("url"):
+            continue
+        url = str(item.get("url", ""))
+        if not is_safe_url(url):
+            continue
+        sources.append(
+            {
+                "url": url,
+                "title": str(item.get("title") or ""),
+                "snippet": str(item.get("snippet") or ""),
+            }
+        )
+    return sources
+
+
+def is_safe_url(url: str) -> bool:
+    """校验 URL 是否安全：仅允许 http/https，长度<=2048，无控制字符"""
+    from urllib.parse import urlparse
+
+    if not url or len(url) > 2048:
+        return False
+    if any(ord(c) < 32 for c in url):
+        return False
+    try:
+        return urlparse(url).scheme in ("http", "https")
+    except Exception:
+        return False
+
+
+def extract_urls(text: str, *, safe_only: bool = True) -> list[str]:
+    """从文本中提取 URL（默认仅返回通过 is_safe_url 校验的链接）"""
     urls = re.findall(r"https?://[^\s)\]}>\"']+", text)
     seen: set[str] = set()
     out: list[str] = []
     for url in urls:
         url = url.rstrip(".,;:!?'\"")
-        if url and url not in seen:
-            seen.add(url)
-            out.append(url)
+        if not url or url in seen:
+            continue
+        if safe_only and not is_safe_url(url):
+            continue
+        seen.add(url)
+        out.append(url)
     return out
 
 
@@ -283,7 +441,7 @@ def validate_config(
     Returns:
         错误 dict（验证失败）或 (normalized_base_url, normalized_api_key) 元组（成功）
     """
-    base_url = normalize_base_url_value(base_url)
+    base_url = normalize_base_url(base_url)
     api_key = normalize_api_key(api_key)
 
     if not base_url:
@@ -344,6 +502,7 @@ def format_http_error(
         started,
         raw=error_text[:2000] if error_text else "",
     )
+    result["status"] = status
     # 429 时解析 Retry-After 头
     if status == 429 and resp_headers is not None:
         retry_after = parse_retry_after(resp_headers)
@@ -432,11 +591,15 @@ async def retry_request(
             if result.get("ok"):
                 break
 
-            # 检查是否为可重试的错误
-            error_msg = result.get("error", "")
-            should_retry = any(
-                f"HTTP {code}" in error_msg for code in retryable_status_codes
-            )
+            # 检查是否为可重试的错误：优先看 status 字段，其次回退到字符串包含
+            status = result.get("status")
+            if isinstance(status, int):
+                should_retry = status in retryable_status_codes
+            else:
+                error_msg = result.get("error", "")
+                should_retry = any(
+                    f"HTTP {code}" in error_msg for code in retryable_status_codes
+                )
 
             if should_retry and attempt < max_retries:
                 retry_count = attempt + 1

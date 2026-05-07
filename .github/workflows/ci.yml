@@ -1,67 +1,78 @@
-name: CI
+name: Code Quality
 
 on:
   push:
-    branches: [master, main]
+    branches: [main, master]
   pull_request:
-    branches: [master, main]
+    branches: [main, master]
+  workflow_dispatch:
 
 jobs:
   lint:
     name: Lint & Format
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.head_ref }}
-          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
+          python-version: "3.11"
+          cache: pip
 
-      - name: Install ruff
-        run: pip install ruff
-
-      - name: Run ruff format (auto-fix)
-        run: ruff format .
-
-      - name: Run ruff check (auto-fix)
-        run: ruff check --fix .
-
-      - name: Commit changes
-        if: github.event_name == 'push'
-        uses: stefanzweifel/git-auto-commit-action@v5
-        with:
-          commit_message: "style: auto-fix with ruff format & check"
-          commit_options: "--no-verify"
-
-      - name: Check for uncommitted changes (PR)
-        if: github.event_name == 'pull_request'
+      - name: Install tools
         run: |
-          if ! git diff --quiet; then
-            echo "::error::Code style issues found. Run 'ruff format . && ruff check --fix .' locally."
-            git diff --stat
-            exit 1
-          fi
+          python -m pip install --upgrade pip
+          pip install ruff
 
-  typecheck:
-    name: Type Check
+      - name: Ruff lint
+        run: |
+          ruff check . \
+            --line-length 88 \
+            --target-version py310 \
+            --extend-exclude plans,docs,templates \
+            --select F,W,E,ASYNC,C4,Q,I,UP \
+            --ignore F403,F405,E501,ASYNC230,ASYNC240 \
+            --per-file-ignores "__init__.py:F401"
+
+      - name: Ruff format check
+        run: ruff format --check . --line-length 88 --exclude plans,docs,templates
+
+  syntax:
+    name: Syntax Check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
+          python-version: "3.11"
 
-      - name: Install dependencies
-        run: pip install aiohttp pyright
+      - name: Compile all Python files
+        run: python -m compileall -q .
 
-      - name: Run pyright
-        run: pyright --verifytypes astrbot_plugin_grok_web_search || true
-        continue-on-error: true
+  metadata:
+    name: Metadata Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install PyYAML
+        run: pip install pyyaml
+
+      - name: Validate metadata.yaml
+        run: |
+          python -c "import yaml,sys; yaml.safe_load(open('metadata.yaml',encoding='utf-8')); print('metadata.yaml OK')"
+
+      - name: Validate _conf_schema.json
+        run: |
+          python -c "import json; json.load(open('_conf_schema.json',encoding='utf-8')); print('_conf_schema.json OK')"
